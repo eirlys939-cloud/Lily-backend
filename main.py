@@ -123,6 +123,7 @@ async def chat(request: Request):
     system: str | None = body.get("system")
     max_tokens: int = int(body.get("max_tokens") or 8192)
     temperature: float = float(body.get("temperature") if body.get("temperature") is not None else 1.0)
+    thinking: dict[str, Any] | None = body.get("thinking")  # extended thinking 透传
 
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -138,6 +139,7 @@ async def chat(request: Request):
                 system=system,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                thinking=thinking,
                 memory_client=memory_client,
                 notion=notion,
             ):
