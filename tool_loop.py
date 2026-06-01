@@ -1,292 +1,173 @@
 """
-工具循环：tool_use ↔ tool_result 多轮，流式 SSE 输出。
-
-工作流：
-1. 把 messages + tools 发给上游（msuicode /v1/messages，stream=True）
-2. 流式解析事件，把文本增量实时 yield 给前端
-3. 遇到 tool_use block：完整收集 → 并发执行（Memory MCP / Notion）→ 喂回 messages
-4. 如果 stop_reason == "tool_use"，回到步骤 1 再来一轮；否则结束
+Lily-Celyn 后端主入口
+- 代理 msuicode /v1/messages（Anthropic 原生格式，流式）
+- 工具循环：合并 Celyn's Memory MCP + Notion 工具集
+- SSE 流式输出给前端
 """
-from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator
+from contextlib import asynccontextmanager
+from typing import Any
 
-import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import settings
+from tool_loop import run_tool_loop
 from mcp_client import CelynMemoryClient
 from notion_tools import NotionTools
 
-log = logging.getLogger("lily.loop")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("lily")
 
 
-def _sse(event: str, data: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+# ============ 启动 / 关闭钩子 ============
 
-
-async def _build_tool_specs(
-    memory_client: CelynMemoryClient,
-    notion: NotionTools,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """
-    返回 (Anthropic tools 数组, 工具路由表)
-    路由表 key 是工具名（前缀化后），value 是 {"kind":"memory","original":"breath"} 或 {"kind":"notion"}
-    """
-    tools_for_api: list[dict[str, Any]] = []
-    routes: dict[str, dict[str, Any]] = {}
-
-    # Memory MCP 工具
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Lily 后端启动中...")
+    # 启动时预热一次工具列表（缓存）
+    app.state.memory_client = CelynMemoryClient(
+        url=settings.CELYN_MEMORY_MCP_URL,
+        bearer=settings.CELYN_MEMORY_BEARER,
+    )
+    app.state.notion = NotionTools(token=settings.NOTION_TOKEN)
     try:
-        mem_tools = await memory_client.list_tools()
+        memory_tools = await app.state.memory_client.list_tools()
+        log.info(f"Celyn's Memory 已连通，共 {len(memory_tools)} 个工具")
     except Exception as e:
-        log.warning(f"无法获取 Memory 工具，本轮跳过：{e}")
-        mem_tools = []
-    for t in mem_tools:
-        name = t["name"]
-        tools_for_api.append({
-            "name": name,
-            "description": t["description"],
-            "input_schema": t["input_schema"],
-        })
-        routes[name] = {"kind": "memory", "original": t["_original_name"]}
+        log.warning(f"Celyn's Memory 预热失败（不影响启动）: {e}")
 
-    # Notion 工具
-    for t in notion.tool_schemas():
-        tools_for_api.append(t)
-        routes[t["name"]] = {"kind": "notion"}
+    notion_tools = app.state.notion.tool_schemas()
+    log.info(f"Notion 工具集就绪，共 {len(notion_tools)} 个工具")
 
-    return tools_for_api, routes
+    yield
+    log.info("Lily 后端关闭")
 
 
-async def _dispatch_tool(
-    name: str,
-    arguments: dict[str, Any],
-    routes: dict[str, dict[str, Any]],
-    memory_client: CelynMemoryClient,
-    notion: NotionTools,
-) -> str:
-    route = routes.get(name)
-    if not route:
-        return f"[error] unknown tool: {name}"
-    if route["kind"] == "memory":
-        return await memory_client.call_tool(route["original"], arguments)
-    if route["kind"] == "notion":
-        return await notion.call(name, arguments)
-    return f"[error] unhandled route kind for {name}"
+app = FastAPI(title="Lily-Celyn Backend", lifespan=lifespan)
+
+# ============ CORS ============
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-async def run_tool_loop(
-    *,
-    model: str,
-    messages: list[dict[str, Any]],
-    system: str | None,
-    max_tokens: int,
-    temperature: float,
-    memory_client: CelynMemoryClient,
-    notion: NotionTools,
-) -> AsyncGenerator[str, None]:
-    """主循环。yields SSE 字符串。"""
+# ============ 健康检查 ============
 
-    tools, routes = await _build_tool_specs(memory_client, notion)
-    log.info(f"工具就绪：共 {len(tools)} 个（Memory + Notion）")
+@app.get("/")
+async def root():
+    return {"name": "Lily-Celyn Backend", "status": "alive"}
 
-    # 复制 messages，准备 in-place 追加 assistant / tool_result
-    convo: list[dict[str, Any]] = list(messages)
 
-    for round_idx in range(settings.MAX_TOOL_ROUNDS):
-        log.info(f"=== 工具循环第 {round_idx + 1} 轮 ===")
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": convo,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": True,
-            "tools": tools,
-        }
-        if system:
-            payload["system"] = system
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
 
-        headers = {
-            "x-api-key": settings.UPSTREAM_API_KEY,
-            "Authorization": f"Bearer {settings.UPSTREAM_API_KEY}",  # 兼容两种鉴权头
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
 
-        # 累积 assistant 消息（用于回写到 convo）
-        assistant_content: list[dict[str, Any]] = []
-        # 正在构建的 content block 索引 → 内容
-        building: dict[int, dict[str, Any]] = {}
-        # 工具输入 JSON 累积器：index → partial_json string
-        tool_json_buf: dict[int, str] = {}
-        stop_reason: str | None = None
+# ============ 列工具（前端可展示有哪些能力） ============
 
-        async with httpx.AsyncClient(timeout=settings.UPSTREAM_TIMEOUT) as cli:
-            async with cli.stream(
-                "POST",
-                f"{settings.UPSTREAM_API_BASE}/messages",
-                headers=headers,
-                json=payload,
-            ) as resp:
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    err_text = body.decode("utf-8", errors="replace")
-                    log.error(f"上游 {resp.status_code}: {err_text}")
-                    yield _sse("error", {
-                        "message": f"上游返回 {resp.status_code}",
-                        "detail": err_text[:500],
-                    })
-                    return
+@app.get("/api/tools")
+async def list_all_tools(request: Request):
+    memory_client: CelynMemoryClient = request.app.state.memory_client
+    notion: NotionTools = request.app.state.notion
 
-                # 解析 SSE
-                current_event: str | None = None
-                async for line in resp.aiter_lines():
-                    if not line:
-                        current_event = None
-                        continue
-                    if line.startswith("event:"):
-                        current_event = line[6:].strip()
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if not data_str:
-                        continue
-                    try:
-                        ev = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+    memory_tools: list[dict[str, Any]] = []
+    try:
+        memory_tools = await memory_client.list_tools()
+    except Exception as e:
+        log.warning(f"读取 Memory 工具失败：{e}")
 
-                    etype = ev.get("type") or current_event
+    return {
+        "memory": [t["name"] for t in memory_tools],
+        "notion": [t["name"] for t in notion.tool_schemas()],
+    }
 
-                    if etype == "content_block_start":
-                        idx = ev.get("index", 0)
-                        block = ev.get("content_block", {})
-                        building[idx] = dict(block)
-                        if block.get("type") == "tool_use":
-                            tool_json_buf[idx] = ""
-                            yield _sse("tool_call_start", {
-                                "id": block.get("id"),
-                                "name": block.get("name"),
-                                "index": idx,
-                            })
 
-                    elif etype == "content_block_delta":
-                        idx = ev.get("index", 0)
-                        delta = ev.get("delta", {})
-                        dtype = delta.get("type")
-                        if dtype == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                yield _sse("content_delta", {"text": text})
-                                # 累积到 building
-                                blk = building.setdefault(idx, {"type": "text", "text": ""})
-                                blk["text"] = blk.get("text", "") + text
-                        elif dtype == "input_json_delta":
-                            partial = delta.get("partial_json", "")
-                            tool_json_buf[idx] = tool_json_buf.get(idx, "") + partial
-                        elif dtype == "thinking_delta":
-                            # 透传给前端，前端可选展示
-                            yield _sse("thinking_delta", {"text": delta.get("thinking", "")})
+# ============ 聊天主入口（流式） ============
 
-                    elif etype == "content_block_stop":
-                        idx = ev.get("index", 0)
-                        blk = building.get(idx)
-                        if blk and blk.get("type") == "tool_use":
-                            raw = tool_json_buf.get(idx, "")
-                            try:
-                                blk["input"] = json.loads(raw) if raw else {}
-                            except json.JSONDecodeError:
-                                blk["input"] = {}
-                            assistant_content.append(blk)
-                        elif blk:
-                            assistant_content.append(blk)
+@app.post("/api/chat")
+async def chat(request: Request):
+    """
+    入参（JSON）：
+    {
+        "model": "claude-opus-4-7",
+        "messages": [{"role":"user","content":"..."}],
+        "system": "可选系统提示",
+        "max_tokens": 8192,
+        "temperature": 1.0
+    }
+    出参：SSE 流。事件类型：
+    - event: content_delta      data: {"text":"..."}        模型文本增量
+    - event: tool_call          data: {"name":"...", "input":{...}, "id":"..."}  即将调用工具
+    - event: tool_result        data: {"id":"...", "ok":true, "preview":"..."}   工具完成
+    - event: turn_done          data: {"stop_reason":"..."}  本轮结束
+    - event: done               data: {}                     整次对话结束
+    - event: error              data: {"message":"..."}      出错
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
 
-                    elif etype == "message_delta":
-                        # 包含 stop_reason
-                        delta = ev.get("delta", {})
-                        if delta.get("stop_reason"):
-                            stop_reason = delta["stop_reason"]
+    model: str = body.get("model") or "claude-opus-4-7"
+    messages: list[dict[str, Any]] = body.get("messages") or []
+    system: str | None = body.get("system")
+    max_tokens: int = int(body.get("max_tokens") or 8192)
+    temperature: float = float(body.get("temperature") if body.get("temperature") is not None else 1.0)
+    thinking: dict[str, Any] | None = body.get("thinking")  # extended thinking 透传
 
-                    elif etype == "message_stop":
-                        pass
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages is required")
 
-        # 一轮 stream 完了
-        yield _sse("turn_done", {"stop_reason": stop_reason or "unknown"})
+    memory_client: CelynMemoryClient = request.app.state.memory_client
+    notion: NotionTools = request.app.state.notion
 
-        # 把这一轮的 assistant message 加进对话历史
-        if assistant_content:
-            convo.append({"role": "assistant", "content": assistant_content})
+    async def event_stream():
+        try:
+            async for evt in run_tool_loop(
+                model=model,
+                messages=messages,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                thinking=thinking,
+                memory_client=memory_client,
+                notion=notion,
+            ):
+                yield evt
+        except Exception as e:
+            log.exception("chat stream failed")
+            err = json.dumps({"message": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {err}\n\n"
+        finally:
+            yield "event: done\ndata: {}\n\n"
 
-        # 看是否需要继续循环
-        tool_uses = [b for b in assistant_content if b.get("type") == "tool_use"]
-        if not tool_uses or stop_reason != "tool_use":
-            log.info("无 tool_use 或 stop_reason 非 tool_use，循环结束")
-            return
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
-        # 并发执行所有工具
-        async def _exec(tu: dict[str, Any]) -> dict[str, Any]:
-            name = tu.get("name", "")
-            args = tu.get("input", {}) or {}
-            tid = tu.get("id", "")
-            yield_evt = {"id": tid, "name": name, "input": args}
-            log.info(f"调用工具 {name} args={args}")
-            try:
-                result = await _dispatch_tool(name, args, routes, memory_client, notion)
-                ok = not result.startswith("[error]") and not result.startswith("[notion error")
-                preview = result if len(result) < 400 else result[:400] + "...(truncated)"
-                return {
-                    "tool_use_id": tid,
-                    "name": name,
-                    "ok": ok,
-                    "result": result,
-                    "preview": preview,
-                }
-            except Exception as e:
-                log.exception(f"工具 {name} 失败")
-                return {
-                    "tool_use_id": tid,
-                    "name": name,
-                    "ok": False,
-                    "result": f"[error] {type(e).__name__}: {e}",
-                    "preview": f"[error] {e}",
-                }
 
-        # 先通知前端正在调哪些工具
-        for tu in tool_uses:
-            yield _sse("tool_call", {
-                "id": tu.get("id"),
-                "name": tu.get("name"),
-                "input": tu.get("input"),
-            })
+# ============ 全局错误处理 ============
 
-        results = await asyncio.gather(*(_exec(tu) for tu in tool_uses))
-
-        # 把结果通知前端
-        for r in results:
-            yield _sse("tool_result", {
-                "id": r["tool_use_id"],
-                "name": r["name"],
-                "ok": r["ok"],
-                "preview": r["preview"],
-            })
-
-        # 把 tool_result 喂回 convo，准备下一轮
-        convo.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": r["tool_use_id"],
-                    "content": r["result"],
-                    **({"is_error": True} if not r["ok"] else {}),
-                }
-                for r in results
-            ],
-        })
-
-    log.warning(f"达到最大工具循环轮数 {settings.MAX_TOOL_ROUNDS}，强制终止")
-    yield _sse("error", {"message": f"达到最大工具循环轮数 {settings.MAX_TOOL_ROUNDS}"})
+@app.exception_handler(Exception)
+async def unhandled(request: Request, exc: Exception):
+    log.exception("unhandled exception")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "detail": str(exc)},
+    )
